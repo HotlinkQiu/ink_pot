@@ -5,6 +5,7 @@ category: 论文研读
 tags:
 - 存储
 - 分布式
+- 数据库
 - Google
 - Bigtable
 ---
