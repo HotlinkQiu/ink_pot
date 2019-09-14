@@ -8,6 +8,8 @@ tags:
 - 数据库
 - Google
 - Bigtable
+- Chubby
+- SSTable
 ---
 
 这篇博客是这一季度分布式存储研究论文研读的第二篇，主要记录的是论文Bigtable: A Distributed Storage System for Structured Data的研读情况。论文发表于OSDI 2006。
@@ -22,12 +24,12 @@ GFS和Bigtable都在其中，关系一目了然。
 
 # Data Model
 
-Bigtable从本质上来讲应该属于一种数据库，同时又提供了普通的数据库所没有的接口。它的数据模型如下：
+Bigtable从本质上来讲应该类似于一种NoSQL数据库，同时又提供了普通的数据库所没有的接口。它的数据模型如下：
 
 > (row:string, column:string, time:int64) -> string
 
-由Bigtable脱胎而来的Cassandra等一些宽列数据库均有类似结构。结构中有以下几个组成部分：
-+ Row：可以看作每条数据是一行，对一行数据的读写操作是原子的。Bigtable会对row key进行字典序排列，尽管每张表的行范围分区随机，但良好的设计row key就能使相关数据相邻连续排列。读取时也只需要访问少数几台机器。
+之后的一些NoSQL数据库如Cassandra，HBase等均有类似结构。结构中有以下几个组成部分：
++ Row：可以看作每条数据是一行，对一行数据的读写操作是原子的。Bigtable会对row key进行字典序排列，尽管每张表的行范围分区随机，但设计良好的row key就能使相关数据相邻连续排列。读取时也只需要访问少数几台机器。
 + Column：column key会被组织成column family，语法是column:qualifier。column family中几个key的取值类型一般相同，设计希望column family是预先设计好的，比较固定，且数量不多（但column的数量不限）。column family是访问控制的最小单位。
 + Timestamp：时间戳最重要的功能是记录同一个值的不同版本。同时也能针对column family定义管理机制：只保留多久版本的记录，或保留最近几个版本。
 
@@ -40,7 +42,9 @@ Bigtable提供了一系列API供用户进行数据操作。有几个要点：
 + Integer数据可用作计数器。
 + 支持在服务器地址空间执行客户端提供的脚本。
 
-> 支持脚本，但脚本不能写回Bigtable是什么意思？
+> 支持脚本，但脚本不能写回Bigtable是什么意思？脚本不能写入数据，但能进行数据转换，数据过滤，数据汇总等“查询”类操作。
+
+Bigtable的一大特点就是支持配合MapReduce使用。
 
 # Building Blocks
 
@@ -50,7 +54,7 @@ Bigtable作为比较上层的应用，依赖于一系列Google产品。
 
 其次，它存储数据的数据结构是Google SSTable，这种数据结构将数据分为小块（64KB），并作索引。方便查找和映射到内存空间。
 
-Bigtable还依赖于分布式锁服务：Chubby。Chubby具有高可用性，通常会维持5个分片并选举一个master。使用Paxos算法来保证分片一致性。Chubby提供一个由目录和文件组成的命名空间（namespace），每个目录或文件都可以作为锁，保证读写一个文件是原子操作。使用Chubby，Bigtable可以：
+Bigtable还依赖于分布式锁服务：Chubby。Chubby具有较高的可用性，通常会维持5个分片并选举一个master。使用Paxos算法来保证分片一致性。Chubby提供一个由目录和文件组成的命名空间（namespace），每个目录或文件都可以作为锁，保证读写一个文件是原子操作。使用Chubby，Bigtable可以：
 
 + 保证只有一个master节点（Bigtabled的master节点，可继续看下一章）；
 + 存储Bigtable数据的bootstrap位置；
@@ -149,3 +153,41 @@ Google内部有不少系统使用了Bigtable来进行存储。2006年8月时，�
 而最重要的一点则是简洁的设计很有价值。能够指导整个工程的开发。
 
 而我读完文章的主要感受是：文章中充满了各种工程设计和优化细节，这些工程细节通常都是最后的10%，也是把一个不错的系统变成一个优秀系统的10%。做任何事都不能忽视最后的10%。
+
+# Six Questions
+
++ 这个技术出现的背景、初衷和要达到什么样的目标或是要解决什么样的问题。
+
+相较于比较底层GFS文件存储系统，Bigtable已经运行在业务层次，会要求数据进行结构化。其本质接近于一个分布式的数据库。在有了GFS后，Google工程师面临的一个现实问题就是：如何利用分布式文件系统将结构化的数据存储下来？更明确一些的需求，例如：如何将Google将要使用到的庞大的网页索引数据存下来，能做到快速的访问，还能很好地做版本维护？另外，Google还有很多的机器学习任务，需要在后台访问非常大的数据集，这部分请求对延时就不太敏感。这些场景可以集成在一个数据库中吗？
+
++ 这个技术的优势和劣势分别是什么，或者说，这个技术的trade-off是什么。
+
+面对分布式系统，一个必须要谈的trade-off就是CAP。P是不可避免的，而Bigtable更加注重C，通过Chubby来实现一致性。但会牺牲一定的可用性A（当出现分区时，直接干掉不能通信的节点）。
+
+另外，Bigtable实现了行的原子性操作，实现了key-value形式的NoSQL存储，但放弃了跨行的事务操作。
+
++ 这个技术使用的场景。
+
+如第一问中所述，Bigtable被实际应用于Google的很多产品中，从Google搜索引擎的网络索引，到Google Earth的地理信息等等。作为一个NoSQL的数据库，同时是一个类似于“宽列”数据库，它适用于对“关系”没有强烈要求的应用。且最好是需要大量顺序读取数据的场景。
+
++ 技术的组成部分和关键点。
+
+Bigtable的组成部分有三个：客户端接入的library，一台master server和许多的tablet server。
+
++ 技术的底层原理和关键实现。
+
+Bigtable本身使用GFS来存储文件，同时使用Chubby来处理分布式锁。而对于同一个数据的更新，Bigtable使用了Log-Structured Merge Tree来记录。
+
++ 已有的实现和它之间的对比。
+
+根据论文的相关工作，可比较的实现包括：Boxwood，CAN，Chord，Tapestry，Pastry，Oracle的Real Application Cluster Database，IBM的DB2等。
+
+与Boxwood相比，Boxwood与Chubby+GFS+Bigtable的功能有不少重合处。在功能重合的点上，Boxwood的组件更加底层，其目标是为更高层的服务，例如文件系统或数据库来提供基础设施。而Bigtable则是直接支持应用来存储数据。
+
+CAN，Chord，Tapestry和Pastry这些分布式数据存储系统工作在一个不受信任的网络上，不稳定的变化的带宽，不受信任的客户端，频繁的配置更改以及拜占庭将军问题等是这些系统关注的重点。
+
+Real Application Cluster Database和DB2均使用事务实现了完整的关系模型。
+
+有不少系统和Bigtable一样，使用了列式存储而非基于行存储，包括C-Store，Sybase IQ，SenSage，KDB+，MonetDB/X100的ColumnBM存储层等。
+
+文中还罗列了一些细节实现上的差异，这里还要讲一下在此之后实现的Amazon DynamoDB，DynamoDB最大的区别就是更加倾向于实现AP而非CP，具体在后面的博客中描述。
