@@ -1,10 +1,10 @@
 ---
 title: 'Go To Production: Serverside Checklist'
 date: 2019-11-16 09:40:21
-category: 工作感悟
+category: 翻译
 tags:
-- 翻译
-- 职场
+- server
+- devops
 ---
 
 本篇博客翻译自：[mtdvio/going-to-production的Serversice checklist](https://github.com/mtdvio/going-to-production/blob/master/serverside-checklist.md)。主要列举了Web App上生产环境之前所需要作的检查。在翻译原列表的同时按照自己所经历的项目作了一些补充。
