@@ -480,3 +480,58 @@ Span处理器会把它处理成Jaeger格式，每个Span带上一个Process对�
 # Span来世
 
 到此我们已经几乎覆盖了Span生命的所有阶段，从它的起源直到最终它上报所追踪应用的信息。从此之后，Span还有可能在一些来世场景出现，例如成为[Prometheus](https://github.com/opentracing-contrib/java-metrics)中的一个数据点，或者在[Grafana](https://grafana.com/) dashboard中和其它Span集成在一起展示，等等等等。最终，管理员可能会决定[清理一些历史数据](https://github.com/jaegertracing/jaeger/blob/7919cd98d30b858808941d72db31015a0317bd2d/plugin/storage/es/esCleaner.py)，然后我们的span就结束了整个生命循环，消失在历史长河中。
+
+# 问题后续
+
+在这之后，一起开发的同事发现了我们Jaeger Span使用中的问题，主要原因是Span创建的语句没有放到try with resource中去，导致内存中相关资源没有被回收，产生的内存泄露。截取代码如下：
+
+原代码：
+
+```java
+@Around("@annotation(com.company.department.project.opentracing.Traced)")
+public Object aroundTracedAdvice(ProceedingJoinPoint jp) throws Throwable {
+    Object res = null;
+    String className = jp.getTarget().getClass().getName();
+    String methodName = jp.getSignature().getName();
+
+    Span span = tracer.buildSpan(className + "." + methodName).withTag("class", className)
+        .withTag("method", methodName).start();
+    tracer.activateSpan(span);
+
+    try {
+        res = jp.proceed();
+    } catch (Throwable t) {
+        TracingUtils.onError(t, span);
+        throw t;
+    } finally {
+        span.finish();
+    }
+ 
+    return res;
+}
+```
+
+修改后的代码：注意其中scope放到了try with resource中去。
+
+```java
+@Around("@annotation(com.company.department.project.opentracing.Traced)")
+public Object aroundTracedAdvice(ProceedingJoinPoint jp) throws Throwable {
+    Object res = null;
+    String className = jp.getTarget().getClass().getName();
+    String methodName = jp.getSignature().getName();
+
+    Span span = tracer.buildSpan(className + "." + methodName).withTag("class", className)
+        .withTag("method", methodName).start();
+
+    try (Scope scope = tracer.activateSpan(span)) {
+        res = jp.proceed();
+    } catch (Throwable t) {
+        TracingUtils.onError(t, span);
+        throw t;
+    } finally {
+        span.finish();
+    }
+ 
+    return res;
+}
+```
