@@ -1,0 +1,70 @@
+---
+title: >-
+  TIME_WAIT and Its Design Implications for Protocols and Scalable Client Server
+  Systems
+date: 2020-03-12 20:18:55
+category: 翻译
+tags:
+- tcp
+- TIME_WAIT 
+---
+
+近来产品销量不错，带来的是服务器疯狂告警：TIME_WAIT连接数量过多。TCP的大致协议我有了解，但其中的很多细节以及中间状态抓得并不深。因此打算翻译这篇[TIME_WAIT and its design implications for protocols and scalable client server](http://www.serverframework.com/asynchronousevents/2011/01/time-wait-and-its-design-implications-for-protocols-and-scalable-servers.html)，学习的同时思考一下怎么解决服务器上的告警问题。
+
+<!-- more -->
+
+在建立使用TCP进行通信的client-server系统时，很容易因为一些小错误严重影响系统的扩展性。其中的一个错误就是没有考虑TIME_WAIT状态。在这篇文章中，我将解释TIME_WAIT状态存在的原因、它可能引发的问题、以及你围绕整个状态应该和不应该做的一些事情。
+
+TIME_WAIT是一个在TCP状态转换图中经常被误解的状态。它标志着一些socket可能进入或停留在了一个相对长时间的状态中。如果你的服务器有大量的socket处在TIME_WAIT状态，那么就很有可能影响你继续创建新的socket连接，从而影响你的服务器扩展能力。首先，对于socket如何以及为什么会进入TIME_WAIT状态就经常有一些误解。按理说这不应该，这个状态转换也并不神奇。从下面的TCP状态转换图可以看到，TCP客户端通常最终都会进入TIME_WAIT状态。
+
+![TCP状态转换](https://hotlinkqiu-blog.oss-cn-shenzhen.aliyuncs.com/time-wait/tcp_state_transition_2.png)
+
+尽管图中显示TIME_WAIT是client的最终状态，但并不表示一定是client才会进入TIME_WAIT。在TCP连接对中，无论是client还是server，谁发起了“active close”，谁就会最终进入TIME_WAIT状态。那么问题来了，“active close”指的是什么呢？
+
+在TCP连接中，一端发起了“active close”表示由这一端在连接中先调用了Close()。在很多协议和client/server架构设计中，都是由client触发。但在HTTP和FTP服务器上，发起的通常是server。导致TCP一端进入TIME_WAIT状态的实际过程如下图所示：
+
+![TCP状态转换](https://hotlinkqiu-blog.oss-cn-shenzhen.aliyuncs.com/time-wait/tcp_state_transition.png)
+
+现在我们知道了socket是如何进入TIME_WAIT状态的。这有助于我们理解为什么存在这个状态，以及为什么它可能隐藏着潜在问题。
+
+TIME_WAIT状态也经常被称为2MSL wait状态，这是因为socket在转变成TIME_WAIT状态以后，会停留2倍的Maximum Segment Lifetime（MSL）时间。MSL指的是组成TCP协议的任何数据包在被丢弃前可以在网络中保留的最大时间。这个时间限制最终会绑定在传输TCP数据的IP报文里的TTL字段中。在不同实现中，MSL会有不同的取值，而最通常的取值是30s，1分钟或2分钟。RFC 793中将这个值定义为2分钟，Windows系统也把2分钟设定为默认值，不过可以通过TcpTimedWaitDelay这个注册设置进行调整。
+
+TIME_WAIT状态可能影响系统扩展性的原因是，一旦一个TCP连接中的socket被关闭了，它仍然会停留在TIME_WAIT状态长达4分钟。如果有大量的连接不断被创建和关闭，那么TIME_WAIT状态的socket就会开始不断累加。你可以用netstat来观察处于TIME_WAIT状态的socket。一台服务器同一时间能够建立的连接数量是有限的，其中的一个限制就是服务器的本地端口数量。如果有太多连接处于TIME_WAIT状态，那么你会发现很难再对外建立连接，因为已经没有足够的本地端口来支持新连接。既然有这样的问题，那么为什么还会存在TIME_WAIT状态呢？
+
+设计TIME_WAIT状态有两个原因。第一个就是防止连接中延迟到达的数据包被误认为是后续的新连接报文。当一个连接处于2MSL wait状态时，任何后续抵达的报文都会被丢弃。
+
+![TCP连接](https://hotlinkqiu-blog.oss-cn-shenzhen.aliyuncs.com/time-wait/tcp_fin.png)
+
+在上图中可以看到从终端1向终端2建立的两个连接，在各个连接中它们的地址和端口都是一样的。第一个连接由终端2发起了“active close”。如果终端2不在TIME_WAIT状态停留足够长的时间来丢弃前一次连接中所有后续报文，那么后续到来的报文（带有合理的sequence number）就有可能被认为是一个新的连接。
+
+请注意，其实这类延迟报文触发的问题很难发生。首先它需要连接中地址和端口都一样，这本身概率就很低，因为使用什么客户端端口是由操作系统从临时端口中选择的，通常不同连接会有不同端口。其次，延迟报文携带的sequence number也很难恰巧在新连接中被判定合法。总之，当这两种情况都发生时，TIME_WAIT状态可以阻止新连接中的数据被延迟报文所影响。
+
+TIME_WAIT状态存在的另一个原因是保证TCP全双工连接中断的可靠性。如果终端2发来的最后一个ACK包丢包了，那么终端1会重发最后一个FIN包。但如果此时终端2上连接已经进入了CLOSED状态，那么它只会回一个RST，因为此时收到的FIN包并不在预期内。这就会导致终端1即使正确发送了所有报文，但最后仍然收到了一个错误回复。
+
+不幸的是，不少操作系统对TIME_WAIT状态的实现看起来略显简单。只有那些真正符合条件的socket才需要被阻塞来获得TIME_WAIT状态提供的保护。需要保护的是那些能够通过client地址和端口，server地址和端口精确匹配标识出来的连接。但有些操作系统实现的限制更加严格，那些处于TIME_WAIT状态的连接使用的本地端口号都不能被复用。如果有足够多的socket进入了TIME_WAIT状态，那么系统就会因为缺少可用的本地端口，而无法创建新的出站连接。
+
+Windows操作系统并不会这样做，它只会限制建立那些与TIME_WAIT状态下的已有连接各属性完全一致的新出站连接。
+
+入站连接很少受TIME_WAIT状态的影响，当一个连接在server的“active close”操作下进入TIME_WAIT状态时，服务器监听的本地端口并不会在一个新的入站连接中被阻止使用。在Windows操作系统中，server正在监听的TIME_WAIT连接的知名端口可以被用于组成新的连接，而如果新连接中的远端地址和端口恰好与将要复用的这个正处于TIME_WAIT状态的连接一致，那么这条连接只接受比TIME_WAIT连接中最后一个sequence number更大sequence number报文。虽然TIME_WAIT对入站连接影响比较小，但一台服务器上的TIME_WAIT连接不断累积会对性能和资源造成影响，因为处理TIME_WAIT过期会需要一些操作，而且连接在最终结束TIME_WAIT状态进而关闭前，会持续占用系统资源（尽管占用的资源不多）。
+
+既然TIME_WAIT状态会因为占用本地端口从而影响服务器创建出站连接，而创建连接时使用的本地端口是由操作系统从临时端口范围中选择的，那么为了改善这种情况，你可以做的第一件事就是确保你的临时端口范围足够大。在Windows操作系统中，你可以调节MaxUserPort这个注册表配置。请注意在默认设置下Windows系统可用的临时端口范围大概在4000个左右，对很多client/server系统来说都太小了。
+
+尽管可以减少socket处于TIME_WAIT状态的时间，但这项操作通常不会有什么帮助。因为只有大量连接建立，然后被active close，才会进入TIME_WAIT状态并引发问题，调节2MSL等待时间通常只会允许在一段时间内创建和关闭更多的连接，所以你需要持续调低2MSL时间直到TIME_WAIT的保护功能失效，此时就可能触发延迟包在后续连接中出现，从而带来问题。当然这种问题只会在几种情况下出现：你对同一个远端地址和端口建立连接而且短时间内用尽了所有的本地端口，或者你需要使用一个固定的本地端口对远端同一个地址和端口建立连接。
+
+修改2MSL时间通常是一个全局生效的配置，除了修改这个配置你还可以尝试修改SO_REUSEADDR同样在socket层面处理TIME_WAIT。这个选项允许创建一个与已有socket的地址和端口都相同的socket，新的socket会劫持老的socket。你可以通过允许SO_REUSEADDR来允许使用一个处在TIME_WAIT状态的端口被用来创建新socket，但也需要承担拒绝服务攻击和数据包窃取的风险。在Windows平台中，另一个socket配置SO_EXCLUSIVEADDRUSE可以避免SO_REUSEADDR引起的一些问题。不过在我看来，与其改变这些配置，不如重新设计系统来完全规避TIME_WAIT问题。
+
+之前图中的TCP状态转换都展示了有序的TCP连接关闭。然而还有另一种关闭TCP连接的方法，叫做abort close，也就是发送一个RST包而不是FIN包。这通常可以通过设置SO_LINER这个socket配置为0。这会导致连接直接使用一个RST来关闭，丢弃等待传输的数据，而不是像正常状态一样传输等待数据并发FIN包结束连接。需要注意的是一旦连接被中断，会直接传输一个RST包，连接中所有的数据都会被丢弃。通常情况下会产生一个error标识“connection has been reset by the peer”。然后对端会知道连接被中断，两边都不会进入TIME_WAIT。
+
+当然一个连接在被RST终止后也会受到TIME_WAIT所保护的延迟报文的影响。不过触发的条件很严苛，几乎不可能。如果要避免中断操作后受延迟报文影响（比如是由中间设备，像是路由器触发了连接关闭），就需要TCP两端都进入TIME_WAIT状态。不过这几乎不会发生，TCP两端目前都只是简单的关闭了连接。
+
+你有很多操作可以阻止TIME_WAIT状态引发问题。其中一些操作假设你有能力来改变你的client和server之间的交互协议。对于大多数自行设计server端的场景都符合这个条件。
+
+对于一个从来不会主动对外建立连接的服务器来说，除了维持处在TIME_WAIT状态下的连接所需要的资源和性能以外，你不需要过分担心。
+
+对于一个既接入连接，又会对外创建连接的服务器来说，黄金准则是保证连接在对端关闭，最好的办法就是无论什么原因，从不发起“active close”。如果对端超时，使用RST中断连接而不是关闭它。如果对端发送了错误数据，同样回复RST，等等。如果服务器从不主动发起“active close”，那么连接就不会进入TIME_WAIT，也就不会受到TIME_WAIT状态带来的问题影响。这种想法下，尽管我们可以很容易知道错误发生时该如何处理，但正常的连接该如何关闭呢？理想的解决办法是在协议中协商由client端发起断开连接。当server认为应当断开连接时，从应用层发一个“连接结束”的报文，告知client主动关闭连接。如果在合理时间内client没有关闭连接，那么server端就终止连接。
+
+而在客户端，事情就更加复杂。既然必定要有一端需要发起“active close”来终止TCP连接，那么把TIME_WAIT状态控制在client端会有以下几个好处：首先，会受TIME_WAIT累积从而影响连接的只会是一个客户端，其它客户端不会受影响。其次，客户端不断对同一个服务器快速打开关闭TCP连接是没有意义的，比处理TIME_WAIT问题更有意义的是维持更长时间的连接。不要设计一个客户端每分钟都会向服务端建立新连接的协议机制，应当使用一个长连接设计，只在连接断开时进行重连。如果中间的路由器拒绝保持连接，你可能需要实现一个应用层面的心跳包，或者使用TCP keep alive，或者接受路由器不断重置连接：好处是不会有TIME_WAIT状态的socket累积。如果你在连接中做的事就是短暂的，那么考虑使用连接池设计来保证连接打开，并复用连接。最后，如果你就是要让客户端向同一个服务器不断快速地打开关闭连接，那么你可能需要设计一个应用层的关闭逻辑，完成关闭逻辑后直接终止连接（abortive close）。你的客户端发送过一个“I'm done”，然后服务器回一个“goodbye”，然后客户端终止连接。
+
+TIME_WAIT状态的存在是有道理的，而缩短2MSL时间或者允许地址复用并不是很好的解决问题的办法。如果你可以设计你的协议来避免TIME_WAIT，那你通常就能完全避免这个问题。
+
+如果你想要了解TIME_WAIT实现上更多的信息，以及它是如何工作的，你可以查看[这篇](http://www.isi.edu/touch/pubs/infocomm99/infocomm99-web)和[这篇](developerweb.net/viewtopic.php?id=2941)文章。
